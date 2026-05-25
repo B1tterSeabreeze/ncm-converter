@@ -1,5 +1,7 @@
 # 🎵 NCM 音乐转换工具
 
+> **📋 声明**：本工具基于 [taurusxin/ncmdump](https://github.com/taurusxin/ncmdump) 项目制作，核心解密引擎由 [taurusxin](https://github.com/taurusxin) 开发。感谢原作者的杰出工作！
+
 > 网易云音乐 NCM 文件批量解密转换工具，基于 [ncmdump](https://github.com/taurusxin/ncmdump) v1.5.1
 
 将网易云音乐下载的 `.ncm` 加密缓存文件批量解密为原始的 `MP3` 或 `FLAC` 格式。提供 **GUI 图形界面** 和 **命令行** 两种使用方式。
