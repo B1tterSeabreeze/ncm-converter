@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# NCM Converter
+ncm_converter_config.json
+ncm_debug.log
+
+# Output files
+*.mp3
+*.flac
+*.ncm
+
+# Test files
+test_*.py
+test_output/
+test_output_skip/
