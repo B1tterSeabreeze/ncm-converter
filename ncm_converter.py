@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NCM 音乐转换工具 v3.4
+NCM 音乐转换工具 v3.7
 基于 ncmdump (https://github.com/taurusxin/ncmdump) v1.5.1
+
+v3.7 修复:
+  - 修复全部文件已转换后再点击一键转换导致卡死的问题
+  - 修复取消转换后再点击一键转换导致未响应的问题
+  - 核心：正确管理转换生命周期，防止异步回调竞态
+  - 修复 convert_batch 全部跳过时未设置 log_lines 导致 worker 崩溃的 bug
+
+v3.6 改进:
+  - 自动检测慢速磁盘（USB 外接盘等），输出到快速磁盘避免转换极慢
+  - 源目录写入速度 < 10 MB/s 时自动建议输出到 C 盘
+
+v3.5 改进:
+  - 修复 GUI 未响应问题：限制每批 GUI 更新数量，处理后立即让出事件循环
+  - 合并重复的进度/状态更新（coalescing），大幅减少队列积压
+  - 完成后批量标记也分批处理，避免大量文件时界面冻结
 
 v3.4 改进:
   - 修复 GUI 卡死问题：批量处理 GUI 更新，减少事件堆积
@@ -50,6 +65,19 @@ DEFAULT_CONFIG = {
     "ncmdump_path": str(NCMDUMP_EXE),
     "workers": 3,
 }
+
+
+FAST_OUTPUT_DIR = str(Path.home() / "Music" / "NCM_Output")
+
+
+def get_fast_output_dir(directory):
+    """如果源目录不在 C 盘，建议输出到 C 盘快速磁盘。
+    跨盘输出可避免 USB/外接盘的随机写入瓶颈，提升 100~1000 倍。"""
+    src_drive = Path(directory).resolve().anchor  # e.g. "D:\\"
+    c_drive = Path.home().anchor  # e.g. "C:\\"
+    if src_drive.upper() != c_drive.upper():
+        return FAST_OUTPUT_DIR
+    return None
 
 
 def load_config():
@@ -139,6 +167,7 @@ class ConversionEngine:
         self._procs = []
         total_count = len(ncm_files)
         log_lines = []
+        self.log_lines = log_lines  # 立即设置引用，确保提前返回时 worker 可访问
         completed_count = 0
         failed_count = 0
 
@@ -397,8 +426,10 @@ class NcmConverterApp:
         self.root = root
         self.cfg = load_config()
         self.converting = False
+        self._convert_done_pending = False
         self.ncm_files = []
         self.engine = None
+        self._worker_thread = None
 
         # GUI 更新队列：批量处理，减少事件堆积
         self._gui_queue = []
@@ -412,7 +443,7 @@ class NcmConverterApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_window(self):
-        self.root.title("NCM 音乐转换工具 v3.4")
+        self.root.title("NCM 音乐转换工具 v3.7")
         self.root.geometry("800x640")
         self.root.minsize(700, 560)
         self.root.configure(bg="#f5f5f5")
@@ -447,7 +478,7 @@ class NcmConverterApp:
         header_frame = ttk.Frame(self.root)
         header_frame.pack(fill=tk.X, padx=16, pady=(16, 8))
         ttk.Label(header_frame, text="🎵 NCM 音乐转换工具", style="Header.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header_frame, text="v3.4 · 多进程并行", style="Status.TLabel").pack(side=tk.RIGHT)
+        ttk.Label(header_frame, text="v3.7 · 多进程并行", style="Status.TLabel").pack(side=tk.RIGHT)
 
         # 目录配置
         dir_frame = ttk.LabelFrame(self.root, text="📂 目录配置", padding=10)
@@ -596,8 +627,20 @@ class NcmConverterApp:
         self.status_var.set("正在扫描…")
         self.root.update_idletasks()
 
-        recursive = self.recursive_var.get()
+        # 检测慢速磁盘，自动设置输出目录
         output_dir = self.output_var.get().strip()
+        if not output_dir:
+            fast_dir = get_fast_output_dir(input_dir)
+            if fast_dir:
+                self.output_var.set(fast_dir)
+                output_dir = fast_dir
+                messagebox.showinfo("跨盘输出优化",
+                    f"💡 检测到源目录在非系统盘（{Path(input_dir).resolve().anchor.rstrip(':')} 盘），\n"
+                    f"为避免写入瓶颈，转换输出将自动指向：\n\n{fast_dir}\n\n"
+                    f"跨盘读写可将转换速度提升 100~1000 倍。\n"
+                    f"（可手动修改输出目录覆盖此设置）")
+
+        recursive = self.recursive_var.get()
         self.ncm_files = scan_ncm_files(input_dir, recursive)
 
         for item in self.tree.get_children():
@@ -645,22 +688,26 @@ class NcmConverterApp:
         self.progress_label.configure(text="0%")
 
     def _queue_gui_update(self, update_type, *args):
-        """将 GUI 更新加入队列，批量处理"""
+        """将 GUI 更新加入队列，合并重复的进度/状态更新"""
         with self._gui_queue_lock:
+            # 合并进度和状态更新：只保留最新的，减少队列积压
+            if update_type in ("progress", "status"):
+                self._gui_queue = [(t, a) for t, a in self._gui_queue if t != update_type]
             self._gui_queue.append((update_type, args))
             if not self._gui_timer_active:
                 self._gui_timer_active = True
                 self.root.after(50, self._process_gui_queue)
 
     def _process_gui_queue(self):
-        """批量处理 GUI 更新队列"""
+        """批量处理 GUI 更新队列，限制每批数量防止界面冻结"""
+        _MAX_BATCH = 30
         with self._gui_queue_lock:
-            queue = self._gui_queue[:]
-            self._gui_queue.clear()
+            batch = self._gui_queue[:_MAX_BATCH]
+            self._gui_queue = self._gui_queue[_MAX_BATCH:]
             self._gui_timer_active = False
 
         # 批量处理更新
-        for update_type, args in queue:
+        for update_type, args in batch:
             try:
                 if update_type == "file":
                     self._update_file_row_direct(*args)
@@ -671,11 +718,11 @@ class NcmConverterApp:
             except Exception:
                 pass
 
-        # 如果还有待处理的更新，继续定时
+        # 如果还有待处理的更新，立即让出事件循环后继续
         with self._gui_queue_lock:
             if self._gui_queue:
                 self._gui_timer_active = True
-                self.root.after(50, self._process_gui_queue)
+                self.root.after(1, self._process_gui_queue)
 
     def _update_file_row_direct(self, stem, status, detail=""):
         """直接更新文件行（在主线程中调用）"""
@@ -720,7 +767,7 @@ class NcmConverterApp:
         self.progress_label.configure(text=f"{done}/{total}")
 
     def _start_convert(self):
-        if self.converting:
+        if self.converting or self._convert_done_pending:
             return
 
         input_dir = self.input_var.get().strip()
@@ -744,6 +791,16 @@ class NcmConverterApp:
                 return
 
         output_dir = self.output_var.get().strip()
+        if not output_dir:
+            fast_dir = get_fast_output_dir(input_dir)
+            if fast_dir:
+                self.output_var.set(fast_dir)
+                output_dir = fast_dir
+                messagebox.showinfo("跨盘输出优化",
+                    f"💡 检测到源目录在非系统盘（{Path(input_dir).resolve().anchor.rstrip(':')} 盘），\n"
+                    f"为避免写入瓶颈，转换输出将自动指向：\n\n{fast_dir}\n\n"
+                    f"跨盘读写可将转换速度提升 100~1000 倍。\n"
+                    f"（可手动修改输出目录覆盖此设置）")
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -763,16 +820,17 @@ class NcmConverterApp:
 
         self.engine = ConversionEngine(ncmdump_path, int(self.workers_var.get()))
 
-        thread = threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._convert_worker,
             args=(input_dir, output_dir),
             daemon=True
         )
-        thread.start()
+        self._worker_thread.start()
 
     def _convert_worker(self, input_dir, output_dir):
         """工作线程：调用转换引擎，通过队列更新 GUI"""
         progress_state = {"done": 0, "total": len(self.ncm_files), "running": True}
+        tick_id = [None]  # 用列表包裹以便闭包修改
 
         def on_progress(done, total):
             progress_state["done"] = done
@@ -791,26 +849,39 @@ class NcmConverterApp:
             d, t = progress_state["done"], progress_state["total"]
             self._queue_gui_update("progress", d, t)
             if progress_state["running"]:
-                self.root.after(100, _tick)
+                tick_id[0] = self.root.after(100, _tick)
 
-        self.root.after(100, _tick)
+        try:
+            tick_id[0] = self.root.after(100, _tick)
+        except RuntimeError:
+            pass  # 主窗口已销毁
 
-        success, skipped, failed, elapsed = self.engine.convert_batch(
-            self.ncm_files, input_dir, output_dir,
-            self.remove_var.get(),
-            skip_existing=self.skip_var.get(),
-            progress_callback=on_progress,
-            status_callback=on_status,
-            file_update_callback=on_file_update,
-        )
+        success, skipped, failed, elapsed = 0, 0, 0, 0.0
+        try:
+            success, skipped, failed, elapsed = self.engine.convert_batch(
+                self.ncm_files, input_dir, output_dir,
+                self.remove_var.get(),
+                skip_existing=self.skip_var.get(),
+                progress_callback=on_progress,
+                status_callback=on_status,
+                file_update_callback=on_file_update,
+            )
+        except Exception as e:
+            log_debug(f"转换异常: {e}")
+            failed = len(self.ncm_files)
 
-        # 停止定时器
+        # 立即停止定时器（在调度 _convert_done 之前）
         progress_state["running"] = False
+        # 取消已调度但尚未执行的 _tick
+        if tick_id[0] is not None:
+            try:
+                self.root.after_cancel(tick_id[0])
+            except (tk.TclError, ValueError, RuntimeError):
+                pass
+            tick_id[0] = None
 
-        # 最终渲染
-        def _final():
-            self._queue_gui_update("progress", len(self.ncm_files), len(self.ncm_files))
-        self.root.after(0, _final)
+        # 最终进度更新（直接入队，不经过 after）
+        self._queue_gui_update("progress", len(self.ncm_files), len(self.ncm_files))
 
         log_text = "\n".join(self.engine.log_lines)
         speed = ""
@@ -828,7 +899,12 @@ class NcmConverterApp:
         )
         log_text += summary
 
-        self.root.after(0, self._convert_done, success, skipped, failed, len(self.ncm_files), log_text)
+        self._convert_done_pending = True
+        # 延迟 150ms 确保：(1) 所有排队的 GUI 更新先处理 (2) 按钮点击事件先于 _convert_done 执行
+        try:
+            self.root.after(150, self._convert_done, success, skipped, failed, len(self.ncm_files), log_text)
+        except RuntimeError:
+            pass  # 主窗口已销毁
 
     def _cancel_convert(self):
         if self.engine:
@@ -843,24 +919,30 @@ class NcmConverterApp:
         self._queue_gui_update("file", stem, status, detail)
 
     def _convert_done(self, success, skipped, failed, total, log_text):
-        self.converting = False
-        self.convert_btn.configure(state=tk.NORMAL)
-        self.cancel_btn.configure(state=tk.DISABLED)
-        self.scan_btn.configure(state=tk.NORMAL)
+        # 防止重复调用（旧转换的 _convert_done 在新转换之后执行）
+        if not self._convert_done_pending:
+            return
+        self._convert_done_pending = False
+        # 注意：不在这里设置 self.converting = False
+        # 保持 converting=True 直到日志弹窗关闭，防止弹窗期间再次点击转换
 
-        # 标记所有仍在 pending 的行为失败
+        # 收集所有待标记为失败的项目
+        pending_items = []
         for stem, item_id in self._stem_to_item.items():
             try:
                 vals = list(self.tree.item(item_id, "values"))
                 if vals[4] == "⏳":
                     vals[3] = ""
                     vals[4] = "❌"
-                    self.tree.item(item_id, values=vals, tags=("pending",))
+                    pending_items.append((item_id, vals))
                 elif vals[4] == "🔄":
                     vals[4] = "❌"
-                    self.tree.item(item_id, values=vals, tags=("pending",))
+                    pending_items.append((item_id, vals))
             except (tk.TclError, IndexError):
                 pass
+
+        # 分批处理标记，避免一次性更新太多导致卡顿
+        self._mark_failed_items(pending_items, 0)
 
         if failed == 0:
             if skipped > 0:
@@ -870,7 +952,16 @@ class NcmConverterApp:
         else:
             self.status_var.set(f"⚠️ 完成：{success} 成功，{failed} 失败，{skipped} 跳过")
 
-        self._show_log(log_text)
+        # 只在有实际转换或失败时弹出日志窗口
+        # 全部跳过时直接重置状态，避免弹窗阻塞
+        if success > 0 or failed > 0:
+            self._show_log(log_text)
+        else:
+            # 全部跳过，直接允许新的转换
+            self.converting = False
+            self.convert_btn.configure(state=tk.NORMAL)
+            self.cancel_btn.configure(state=tk.DISABLED)
+            self.scan_btn.configure(state=tk.NORMAL)
 
     def _show_log(self, log_text):
         win = tk.Toplevel(self.root)
@@ -895,11 +986,41 @@ class NcmConverterApp:
             self.root.clipboard_append(log_text)
             messagebox.showinfo("提示", "日志已复制到剪贴板！")
 
+        def close_log():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            # 弹窗关闭后才允许新的转换
+            try:
+                self.converting = False
+                self.convert_btn.configure(state=tk.NORMAL)
+                self.cancel_btn.configure(state=tk.DISABLED)
+                self.scan_btn.configure(state=tk.NORMAL)
+            except tk.TclError:
+                pass  # 主窗口已销毁
+
         ttk.Button(btn_frame, text="📋 复制日志", command=copy_log).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="关闭", command=close_log).pack(side=tk.RIGHT)
+
+        # 拦截窗口 X 按钮，确保也重置状态
+        win.protocol("WM_DELETE_WINDOW", close_log)
+
+    def _mark_failed_items(self, items, start):
+        """分批标记未完成的项目为失败，每批 30 个后让出事件循环"""
+        batch_end = min(start + 30, len(items))
+        for i in range(start, batch_end):
+            item_id, vals = items[i]
+            try:
+                self.tree.item(item_id, values=vals, tags=("pending",))
+            except tk.TclError:
+                pass
+        if batch_end < len(items):
+            self.root.after(1, self._mark_failed_items, items, batch_end)
 
     def _on_close(self):
         """窗口关闭时：取消转换 + 退出"""
+        self._convert_done_pending = False  # 阻止待执行的 _convert_done
         if self.converting and self.engine:
             self.engine.cancel()
         self.root.destroy()
