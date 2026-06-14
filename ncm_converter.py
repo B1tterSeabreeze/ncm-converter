@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NCM 音乐转换工具 v3.7
+NCM 音乐转换工具 v3.8
 基于 ncmdump (https://github.com/taurusxin/ncmdump) v1.5.1
+
+v3.8 修复:
+  - 修复转换完成后 GUI 永久卡死的问题（根本原因：after(1,...) 紧凑回调循环阻塞事件循环）
+  - 所有 after() 回调统一追踪管理，转换完成/窗口关闭时自动取消
+  - after(1,...) 改为 after(16,...)，给事件循环留出处理用户交互的时间（~60fps）
+  - 转换完成时同步排空 GUI 队列，避免残留回调持续占用主线程
 
 v3.7 修复:
   - 修复全部文件已转换后再点击一键转换导致卡死的问题
@@ -435,6 +441,7 @@ class NcmConverterApp:
         self._gui_queue = []
         self._gui_queue_lock = threading.Lock()
         self._gui_timer_active = False
+        self._after_ids = []  # 追踪所有 after() 回调 ID，便于取消
 
         self._setup_window()
         self._build_ui()
@@ -443,7 +450,7 @@ class NcmConverterApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_window(self):
-        self.root.title("NCM 音乐转换工具 v3.7")
+        self.root.title("NCM 音乐转换工具 v3.8")
         self.root.geometry("800x640")
         self.root.minsize(700, 560)
         self.root.configure(bg="#f5f5f5")
@@ -592,6 +599,44 @@ class NcmConverterApp:
         if self.cfg.get("last_output_dir") and Path(self.cfg["last_output_dir"]).is_dir():
             self.output_var.set(self.cfg["last_output_dir"])
 
+    # ─── after() 回调追踪与取消 ─────────────────────────────────────────
+
+    def _safe_after(self, ms, func, *args):
+        """调度 after() 回调并追踪其 ID，便于统一取消。
+        使用 after(16,...) 代替 after(1,...) 可给事件循环留出处理用户交互的时间。"""
+        try:
+            aid = self.root.after(ms, func, *args)
+            self._after_ids.append(aid)
+            return aid
+        except (tk.TclError, RuntimeError):
+            return None
+
+    def _cancel_pending_afters(self):
+        """取消所有已追踪的 after() 回调"""
+        for aid in self._after_ids:
+            try:
+                self.root.after_cancel(aid)
+            except (tk.TclError, ValueError, RuntimeError):
+                pass
+        self._after_ids.clear()
+
+    def _drain_gui_queue(self):
+        """同步排空 GUI 更新队列（不经过 after 链）"""
+        with self._gui_queue_lock:
+            remaining = list(self._gui_queue)
+            self._gui_queue.clear()
+            self._gui_timer_active = False
+        for update_type, args in remaining:
+            try:
+                if update_type == "file":
+                    self._update_file_row_direct(*args)
+                elif update_type == "status":
+                    self._update_status_direct(*args)
+                elif update_type == "progress":
+                    self._update_progress_direct(*args)
+            except Exception:
+                pass
+
     def _browse_input(self):
         init_dir = self.input_var.get() or str(Path.home())
         d = filedialog.askdirectory(title="选择 NCM 文件所在目录", initialdir=init_dir)
@@ -696,7 +741,7 @@ class NcmConverterApp:
             self._gui_queue.append((update_type, args))
             if not self._gui_timer_active:
                 self._gui_timer_active = True
-                self.root.after(50, self._process_gui_queue)
+                self._safe_after(50, self._process_gui_queue)
 
     def _process_gui_queue(self):
         """批量处理 GUI 更新队列，限制每批数量防止界面冻结"""
@@ -722,7 +767,7 @@ class NcmConverterApp:
         with self._gui_queue_lock:
             if self._gui_queue:
                 self._gui_timer_active = True
-                self.root.after(1, self._process_gui_queue)
+                self._safe_after(16, self._process_gui_queue)
 
     def _update_file_row_direct(self, stem, status, detail=""):
         """直接更新文件行（在主线程中调用）"""
@@ -852,7 +897,7 @@ class NcmConverterApp:
                 tick_id[0] = self.root.after(100, _tick)
 
         try:
-            tick_id[0] = self.root.after(100, _tick)
+            tick_id[0] = self._safe_after(100, _tick)
         except RuntimeError:
             pass  # 主窗口已销毁
 
@@ -902,7 +947,7 @@ class NcmConverterApp:
         self._convert_done_pending = True
         # 延迟 150ms 确保：(1) 所有排队的 GUI 更新先处理 (2) 按钮点击事件先于 _convert_done 执行
         try:
-            self.root.after(150, self._convert_done, success, skipped, failed, len(self.ncm_files), log_text)
+            self._safe_after(150, self._convert_done, success, skipped, failed, len(self.ncm_files), log_text)
         except RuntimeError:
             pass  # 主窗口已销毁
 
@@ -954,6 +999,11 @@ class NcmConverterApp:
 
         # 只在有实际转换或失败时弹出日志窗口
         # 全部跳过时直接重置状态，避免弹窗阻塞
+        # 同步排空 GUI 队列，确保所有待处理更新立即生效
+        self._drain_gui_queue()
+        # 取消所有残留的 after() 回调（_process_gui_queue 链、_tick 等）
+        self._cancel_pending_afters()
+
         if success > 0 or failed > 0:
             self._show_log(log_text)
         else:
@@ -1016,11 +1066,12 @@ class NcmConverterApp:
             except tk.TclError:
                 pass
         if batch_end < len(items):
-            self.root.after(1, self._mark_failed_items, items, batch_end)
+            self._safe_after(16, self._mark_failed_items, items, batch_end)
 
     def _on_close(self):
         """窗口关闭时：取消转换 + 退出"""
         self._convert_done_pending = False  # 阻止待执行的 _convert_done
+        self._cancel_pending_afters()  # 取消所有残留回调
         if self.converting and self.engine:
             self.engine.cancel()
         self.root.destroy()
